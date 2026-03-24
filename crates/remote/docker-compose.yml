@@ -17,7 +17,7 @@ services:
       retries: 5
       start_period: 5s
     ports:
-      - "5433:5432"
+      - "${REMOTE_DB_PORT:-5433}:5432"
 
   azurite:
     image: mcr.microsoft.com/azure-storage/azurite:latest
