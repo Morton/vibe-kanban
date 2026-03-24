@@ -25,6 +25,56 @@ Do not manually edit shared/types.ts, instead edit crates/server/src/bin/generat
 For remote/cloud types, regenerate using `pnpm run remote:generate-types`
 Do not manually edit shared/remote-types.ts, instead edit crates/remote/src/bin/remote-generate-types.rs (see crates/remote/AGENTS.md for details).
 
+## Full Local Dev Setup (with auth + all features)
+
+Running `pnpm run dev` alone only supports workspace creation — login and the kanban board require the remote backend. Follow these steps once to get everything working.
+
+### Prerequisites
+- Docker Desktop running
+- Rust via **rustup** (not Homebrew) with the `nightly-2025-12-04` toolchain — `rustup toolchain install nightly-2025-12-04`
+- `cargo-watch` — `cargo install cargo-watch`
+- A GitHub OAuth App with callback URL `http://localhost:3000/v1/oauth/github/callback` ([create one here](https://github.com/settings/developers))
+
+### One-time setup
+
+1. Create `crates/remote/.env.remote`:
+   ```env
+   VIBEKANBAN_REMOTE_JWT_SECRET=<output of: openssl rand -base64 48>
+   ELECTRIC_ROLE_PASSWORD=localdevpassword
+   GITHUB_OAUTH_CLIENT_ID=<your client id>
+   GITHUB_OAUTH_CLIENT_SECRET=<your client secret>
+   VITE_RELAY_API_BASE_URL=http://localhost:8082
+   REMOTE_DB_PORT=5439
+   ```
+   > Use `REMOTE_DB_PORT=5439` (or any free port) if 5433 is taken by another local Postgres container.
+
+2. Build and start the remote stack (Docker):
+   ```bash
+   cd crates/remote
+   docker compose --env-file .env.remote -f docker-compose.yml up --build
+   ```
+   Wait for `remote-server-1 | INFO remote: Server listening on 0.0.0.0:8081`.
+   Subsequent starts are fast (images already built): use `up -d` instead of `up --build`.
+
+### Running the dev server
+
+Always start the dev server with `VK_SHARED_API_BASE` pointing at the local remote:
+
+```bash
+VK_SHARED_API_BASE=http://localhost:3000 pnpm run dev
+```
+
+- Frontend: http://localhost:3001
+- Local backend: port auto-assigned (3002 or 3003), written to `/tmp/vibe-kanban/vibe-kanban.port`
+- Remote server: http://localhost:3000
+- Relay server: http://localhost:8082
+
+### Port conflicts
+If port 5433 is already in use by another Postgres container, set `REMOTE_DB_PORT` in `.env.remote` to a free port (e.g. 5439). The `docker-compose.yml` respects this variable.
+
+### Note on first build
+The initial Rust compilation takes ~25 minutes. Subsequent incremental builds are fast. The build cache lives in `target/` — if that directory is deleted a full rebuild is required.
+
 ## Build, Test, and Development Commands
 - Install: `pnpm i`
 - Run dev (web app + backend with ports auto-assigned): `pnpm run dev`
