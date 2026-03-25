@@ -20,6 +20,14 @@ green() { printf '\033[0;32m%s\033[0m\n' "$*"; }
 yellow() { printf '\033[0;33m%s\033[0m\n' "$*"; }
 red() { printf '\033[0;31m%s\033[0m\n' "$*"; }
 
+# -- Rustup -------------------------------------------------------------------
+# Ensure rustup-managed cargo takes precedence over any system Rust (e.g. Homebrew).
+# The rust-toolchain.toml will then select the correct nightly automatically.
+if [ -f "$HOME/.cargo/env" ]; then
+  # shellcheck source=/dev/null
+  source "$HOME/.cargo/env"
+fi
+
 # -- Checks -------------------------------------------------------------------
 if ! docker info > /dev/null 2>&1; then
   red "Docker is not running. Please start Docker Desktop and try again."
