@@ -1,0 +1,230 @@
+# =============================================================================
+# docker-compose.full.yml — Run the ENTIRE Vibe Kanban stack in containers
+# =============================================================================
+#
+# This includes:
+#   - PostgreSQL database
+#   - ElectricSQL real-time sync
+#   - Azurite blob storage emulator
+#   - Remote server (Cloud backend with OAuth, teams, real-time)
+#   - Relay server (tunnel support)
+#   - Local vibe-kanban server with Claude Code executor support
+#   - Caddy reverse proxy (automatic HTTPS for production)
+#
+# Quick start:
+#   cp .env.example .env    # fill in required values
+#   docker compose -f docker-compose.full.yml --env-file .env up -d --build
+#
+# See docs/self-hosting/deploy-docker-full.mdx for detailed setup instructions.
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — shared database for the remote server
+  # ---------------------------------------------------------------------------
+  remote-db:
+    image: postgres:16-alpine
+    command: ["postgres", "-c", "wal_level=logical"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: remote
+      POSTGRES_USER: remote
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-remote}
+    volumes:
+      - remote-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U remote -d remote"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # ---------------------------------------------------------------------------
+  # Azurite — Azure Blob Storage emulator for file attachments
+  # ---------------------------------------------------------------------------
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    command: "azurite-blob --blobHost 0.0.0.0 --blobPort 10000 --loose --skipApiVersionCheck"
+    restart: unless-stopped
+    volumes:
+      - azurite-data:/data
+    healthcheck:
+      test: nc 127.0.0.1 10000 -z
+      interval: 1s
+      retries: 30
+
+  azurite-init:
+    image: mcr.microsoft.com/azure-cli:latest
+    depends_on:
+      azurite:
+        condition: service_healthy
+    environment:
+      AZURE_STORAGE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;"
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        set -e
+        az storage container create --name issue-attachments 2>/dev/null || true
+        az storage cors add --services b --methods GET PUT POST DELETE OPTIONS --origins '*' --allowed-headers '*' --exposed-headers '*' --max-age 3600
+        echo "Azurite CORS configured"
+
+  # ---------------------------------------------------------------------------
+  # ElectricSQL — real-time database sync layer
+  # ---------------------------------------------------------------------------
+  electric:
+    image: electricsql/electric:1.4.13
+    working_dir: /app
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://electric_sync:${ELECTRIC_ROLE_PASSWORD:-remote}@remote-db:5432/remote?sslmode=disable
+      PG_PROXY_PORT: 65432
+      LOGICAL_PUBLISHER_HOST: electric
+      AUTH_MODE: insecure
+      ELECTRIC_INSECURE: true
+      ELECTRIC_MANUAL_TABLE_PUBLISHING: true
+      ELECTRIC_USAGE_REPORTING: false
+      ELECTRIC_FEATURE_FLAGS: allow_subqueries,tagged_subqueries
+    volumes:
+      - electric-data:/app/persistent
+    depends_on:
+      remote-db:
+        condition: service_healthy
+      remote-server:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Remote server — Cloud backend (OAuth, teams, real-time sync UI)
+  # ---------------------------------------------------------------------------
+  remote-server:
+    build:
+      context: .
+      dockerfile: crates/remote/Dockerfile
+      args:
+        VITE_RELAY_API_BASE_URL: ${VITE_RELAY_API_BASE_URL:-http://localhost:8082}
+    restart: unless-stopped
+    depends_on:
+      remote-db:
+        condition: service_healthy
+      azurite-init:
+        condition: service_completed_successfully
+    environment:
+      RUST_LOG: info,remote=info
+      SERVER_DATABASE_URL: postgres://remote:${DB_PASSWORD:-remote}@remote-db:5432/remote
+      SERVER_LISTEN_ADDR: 0.0.0.0:8081
+      ELECTRIC_URL: http://electric:3000
+      SERVER_PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3000}
+      GITHUB_OAUTH_CLIENT_ID: ${GITHUB_OAUTH_CLIENT_ID:-}
+      GITHUB_OAUTH_CLIENT_SECRET: ${GITHUB_OAUTH_CLIENT_SECRET:-}
+      GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:-}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:-}
+      VIBEKANBAN_REMOTE_JWT_SECRET: ${VIBEKANBAN_REMOTE_JWT_SECRET}
+      ELECTRIC_ROLE_PASSWORD: ${ELECTRIC_ROLE_PASSWORD:-remote}
+      LOOPS_EMAIL_API_KEY: ${LOOPS_EMAIL_API_KEY:-}
+      LOOPS_INVITE_TEMPLATE_ID: ${LOOPS_INVITE_TEMPLATE_ID:-cmhvy2wgs3s13z70i1pxakij9}
+      LOOPS_REVIEW_READY_TEMPLATE_ID: ${LOOPS_REVIEW_READY_TEMPLATE_ID:-cmj47k5ge16990iylued9by17}
+      LOOPS_REVIEW_FAILED_TEMPLATE_ID: ${LOOPS_REVIEW_FAILED_TEMPLATE_ID:-cmj49ougk1c8s0iznavijdqpo}
+      AZURE_STORAGE_ACCOUNT_NAME: devstoreaccount1
+      AZURE_STORAGE_ACCOUNT_KEY: "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+      AZURE_STORAGE_CONTAINER_NAME: issue-attachments
+      AZURE_STORAGE_ENDPOINT_URL: http://azurite:10000/devstoreaccount1
+      AZURE_STORAGE_PUBLIC_ENDPOINT_URL: http://localhost:10000/devstoreaccount1
+    ports:
+      - "${REMOTE_SERVER_PORTS:-127.0.0.1:3000:8081}"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8081/v1/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Relay server — tunnel support for remote agent connections
+  # ---------------------------------------------------------------------------
+  relay-server:
+    build:
+      context: .
+      dockerfile: crates/relay-tunnel/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      remote-db:
+        condition: service_healthy
+    environment:
+      RUST_LOG: info
+      SERVER_DATABASE_URL: postgres://remote:${DB_PASSWORD:-remote}@remote-db:5432/remote
+      RELAY_LISTEN_ADDR: 0.0.0.0:8082
+      VIBEKANBAN_REMOTE_JWT_SECRET: ${VIBEKANBAN_REMOTE_JWT_SECRET}
+    ports:
+      - "127.0.0.1:${RELAY_SERVER_PORT:-8082}:8082"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8082/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Vibe Kanban local server — with Claude Code executor support
+  # ---------------------------------------------------------------------------
+  # This is the main local server that spawns Claude Code (and other AI agents)
+  # as subprocesses. It includes Node.js in the runtime for npx support and
+  # the vibe-kanban-mcp binary for MCP protocol integration.
+  vibe-kanban:
+    build:
+      context: .
+      dockerfile: Dockerfile.claude
+      args:
+        VK_SHARED_API_BASE: http://remote-server:8081
+    restart: unless-stopped
+    depends_on:
+      remote-server:
+        condition: service_healthy
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "3000"
+      RUST_LOG: info
+      VK_SHARED_API_BASE: http://remote-server:8081
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    volumes:
+      # Project repositories — Claude Code reads and writes files here
+      - ${REPOS_DIR:-./_repos}:/repos
+      # Persistent server data (SQLite database, config, credentials)
+      - vk-data:/home/appuser/.local/share/vibe-kanban
+    ports:
+      - "${VK_LOCAL_PORT:-3002}:3000"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # Caddy — reverse proxy with automatic HTTPS (for production)
+  # ---------------------------------------------------------------------------
+  # Uncomment this service for production deployments with a real domain.
+  # For local development, access services directly via their ports.
+  #
+  # caddy:
+  #   image: caddy:2-alpine
+  #   restart: unless-stopped
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   environment:
+  #     DOMAIN: ${DOMAIN:-localhost}
+  #   volumes:
+  #     - ./Caddyfile.full:/etc/caddy/Caddyfile
+  #     - caddy_data:/data
+  #     - caddy_config:/config
+  #   depends_on:
+  #     - remote-server
+  #     - relay-server
+
+volumes:
+  remote-db-data:
+  electric-data:
+  azurite-data:
+  vk-data:
+  # caddy_data:
+  # caddy_config:

@@ -1,0 +1,376 @@
+---
+title: "Full Docker Deployment (with Claude Code)"
+description: "Run the entire Vibe Kanban stack in Docker containers, including the local server with Claude Code AI agent support"
+---
+
+This guide covers deploying the **complete** Vibe Kanban stack in Docker — including the local server with Claude Code executor support. Everything runs in containers; no Rust toolchain, Node.js, or native installations are needed on the host.
+
+## Architecture Overview
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                     Docker Compose Stack                         │
+│                                                                  │
+│  ┌──────────────┐  ┌──────────────┐  ┌───────────────────────┐  │
+│  │  PostgreSQL   │  │  ElectricSQL  │  │       Azurite         │  │
+│  │  (remote-db)  │  │  (electric)   │  │   (blob storage)      │  │
+│  │  :5432        │  │  :3000 int.   │  │   :10000              │  │
+│  └──────┬───────┘  └──────┬───────┘  └───────────────────────┘  │
+│         │                  │                                     │
+│  ┌──────┴──────────────────┴──────┐  ┌────────────────────────┐  │
+│  │        Remote Server           │  │     Relay Server       │  │
+│  │   (Cloud backend + Web UI)     │  │   (tunnel support)     │  │
+│  │   :8081 int. → :3000 ext.      │  │   :8082                │  │
+│  └────────────────┬───────────────┘  └────────────────────────┘  │
+│                   │                                              │
+│  ┌────────────────┴───────────────────────────────────────────┐  │
+│  │              Vibe Kanban Local Server                       │  │
+│  │   (server binary + Node.js + Claude Code + MCP)            │  │
+│  │   :3000 int. → :3002 ext.                                  │  │
+│  │                                                             │  │
+│  │   Volumes:                                                  │  │
+│  │   ├── /repos ← your project folders (bind mount)           │  │
+│  │   └── vk-data ← SQLite DB + config (named volume)          │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+**Services:**
+
+| Service | Description | Internal Port | Default External Port |
+|---|---|---|---|
+| `remote-db` | PostgreSQL 16 database | 5432 | — |
+| `electric` | ElectricSQL real-time sync | 3000 | — |
+| `azurite` | Azure Blob Storage emulator | 10000 | — |
+| `remote-server` | Cloud backend (OAuth, teams, web UI) | 8081 | 3000 |
+| `relay-server` | Tunnel support | 8082 | 8082 |
+| `vibe-kanban` | Local server + Claude Code | 3000 | 3002 |
+
+## Prerequisites
+
+- **Docker** and **Docker Compose** v2.0+ installed
+- **4GB RAM** minimum (8GB recommended — the Rust build is memory-intensive)
+- **20GB disk space** (for Docker images and build cache)
+- An **Anthropic API key** ([get one here](https://console.anthropic.com/)) or an existing Claude Code login
+- **OAuth credentials** from [GitHub](https://github.com/settings/developers) or [Google](https://console.cloud.google.com/apis/credentials)
+
+## Quick Start
+
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/BloopAI/vibe-kanban.git
+cd vibe-kanban
+```
+
+### 2. Create your environment file
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` and fill in the required values:
+
+```bash
+# Generate a JWT secret
+openssl rand -base64 48
+```
+
+At minimum, set these variables in `.env`:
+
+```env
+VIBEKANBAN_REMOTE_JWT_SECRET=<your generated secret>
+ELECTRIC_ROLE_PASSWORD=changeme
+DB_PASSWORD=changeme
+ANTHROPIC_API_KEY=sk-ant-...
+GITHUB_OAUTH_CLIENT_ID=<your client id>
+GITHUB_OAUTH_CLIENT_SECRET=<your client secret>
+REPOS_DIR=/path/to/your/projects
+```
+
+### 3. Configure OAuth callback URLs
+
+Set your OAuth application callback URL to:
+
+- **GitHub**: `http://localhost:3000/v1/oauth/github/callback`
+- **Google**: `http://localhost:3000/v1/oauth/google/callback`
+
+### 4. Build and start
+
+```bash
+docker compose -f docker-compose.full.yml --env-file .env up -d --build
+```
+
+<Warning>
+The first build takes 15–25 minutes (Rust compilation). Subsequent builds are much faster due to Docker layer caching.
+</Warning>
+
+### 5. Verify
+
+```bash
+# Check all services are healthy
+docker compose -f docker-compose.full.yml ps
+
+# View logs
+docker compose -f docker-compose.full.yml logs -f
+```
+
+- **Remote server (Cloud UI)**: [http://localhost:3000](http://localhost:3000) — sign in with OAuth
+- **Local server (with Claude Code)**: [http://localhost:3002](http://localhost:3002)
+
+## Claude Code Authentication
+
+Claude Code runs as a subprocess inside the `vibe-kanban` container. It needs authentication to call the Anthropic API. Choose one method:
+
+### Method A: Anthropic API Key (Recommended)
+
+Set `ANTHROPIC_API_KEY` in your `.env` file. This is the simplest approach for headless/server deployments.
+
+```env
+ANTHROPIC_API_KEY=sk-ant-api03-...
+```
+
+<Info>
+With an API key, usage is billed via Anthropic pay-as-you-go pricing, not your Claude subscription. The Vibe Kanban UI will display a notice about this.
+</Info>
+
+### Method B: Claude Code Login Credentials
+
+If you prefer to use your Claude subscription, mount your local Claude credentials file:
+
+```env
+CLAUDE_AUTH_DIR=~/.claude.json
+```
+
+Then add this volume to the `vibe-kanban` service in `docker-compose.full.yml`:
+
+```yaml
+vibe-kanban:
+  volumes:
+    - ${CLAUDE_AUTH_DIR}:/home/appuser/.claude.json:ro
+```
+
+<Warning>
+The `.claude.json` file contains your Claude session token. Mount it as read-only (`:ro`) and never commit it to version control.
+</Warning>
+
+## Project Folder Access
+
+Claude Code reads and writes files directly on disk. Your project repositories must be accessible inside the container.
+
+### Bind mount your projects directory
+
+Set `REPOS_DIR` in `.env` to the host directory containing your git repos:
+
+```env
+REPOS_DIR=/home/youruser/projects
+```
+
+This is mounted at `/repos` inside the container.
+
+### File permissions
+
+The container runs as `appuser` (UID 10001). Your bind-mounted directory must be readable and writable by this user. Options:
+
+```bash
+# Option 1: Make the directory world-writable (simple, less secure)
+chmod -R a+rw /path/to/your/projects
+
+# Option 2: Change ownership to match the container user
+sudo chown -R 10001:10001 /path/to/your/projects
+
+# Option 3: Use Docker user namespace remapping (advanced)
+# See Docker documentation for details
+```
+
+## Git SSH Access
+
+If your repositories use SSH URLs (e.g., `git@github.com:...`), mount your SSH keys:
+
+```env
+SSH_DIR=~/.ssh
+```
+
+Add this volume to the `vibe-kanban` service in `docker-compose.full.yml`:
+
+```yaml
+vibe-kanban:
+  volumes:
+    - ${SSH_DIR}:/home/appuser/.ssh:ro
+```
+
+<Info>
+For HTTPS-based git operations, SSH keys are not needed. Use personal access tokens or credential helpers instead.
+</Info>
+
+## Starting and Stopping
+
+```bash
+# Start all services (detached)
+docker compose -f docker-compose.full.yml --env-file .env up -d
+
+# Start with rebuild (after code changes)
+docker compose -f docker-compose.full.yml --env-file .env up -d --build
+
+# Stop all services (preserves data)
+docker compose -f docker-compose.full.yml down
+
+# Stop and remove all data (fresh start)
+docker compose -f docker-compose.full.yml down -v
+
+# View logs
+docker compose -f docker-compose.full.yml logs -f
+
+# View logs for a specific service
+docker compose -f docker-compose.full.yml logs -f vibe-kanban
+```
+
+## Production Deployment with HTTPS
+
+For production deployments with a real domain, enable the Caddy reverse proxy:
+
+### 1. Uncomment the Caddy service in `docker-compose.full.yml`
+
+Uncomment the `caddy` service block and its associated volumes (`caddy_data`, `caddy_config`).
+
+### 2. Update your `.env`
+
+```env
+DOMAIN=kanban.example.com
+PUBLIC_BASE_URL=https://kanban.example.com
+VITE_RELAY_API_BASE_URL=https://relay.kanban.example.com
+REMOTE_SERVER_PORTS=127.0.0.1:3000:8081  # keep localhost-only, Caddy handles external traffic
+```
+
+### 3. Update OAuth callback URLs
+
+Update your OAuth application callback URLs to use your domain:
+
+- **GitHub**: `https://kanban.example.com/v1/oauth/github/callback`
+- **Google**: `https://kanban.example.com/v1/oauth/google/callback`
+
+### 4. Point DNS
+
+Create A/AAAA records pointing `kanban.example.com` and `relay.kanban.example.com` to your server's IP.
+
+### 5. Deploy
+
+```bash
+docker compose -f docker-compose.full.yml --env-file .env up -d --build
+```
+
+Caddy will automatically obtain SSL certificates from Let's Encrypt.
+
+## Updating
+
+```bash
+cd vibe-kanban
+git pull origin main
+
+docker compose -f docker-compose.full.yml --env-file .env up -d --build
+```
+
+## Backup and Restore
+
+### Backup the PostgreSQL database
+
+```bash
+docker compose -f docker-compose.full.yml exec remote-db \
+  pg_dump -U remote remote > backup_$(date +%Y%m%d).sql
+```
+
+### Restore the database
+
+```bash
+docker compose -f docker-compose.full.yml exec -T remote-db \
+  psql -U remote remote < backup_20240101.sql
+```
+
+### Backup local server data
+
+The local server's SQLite database and configuration are in the `vk-data` named volume:
+
+```bash
+docker run --rm -v vibe-kanban_vk-data:/data -v $(pwd):/backup \
+  alpine tar czf /backup/vk-data-backup.tar.gz -C /data .
+```
+
+## Troubleshooting
+
+<AccordionGroup>
+<Accordion title="Build fails with out-of-memory errors">
+The Rust compilation requires significant memory. Add swap space:
+
+```bash
+sudo fallocate -l 4G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+```
+
+Or increase Docker's memory limit in Docker Desktop settings.
+</Accordion>
+
+<Accordion title="Claude Code reports 'not found' or 'not authenticated'">
+Verify your authentication setup:
+
+```bash
+# Check if ANTHROPIC_API_KEY is set inside the container
+docker compose -f docker-compose.full.yml exec vibe-kanban env | grep ANTHROPIC
+
+# If using .claude.json mount, verify it exists
+docker compose -f docker-compose.full.yml exec vibe-kanban ls -la /home/appuser/.claude.json
+
+# Verify Claude Code is installed
+docker compose -f docker-compose.full.yml exec vibe-kanban claude --version
+```
+</Accordion>
+
+<Accordion title="Permission denied on /repos">
+The container runs as UID 10001. Ensure your project directory is accessible:
+
+```bash
+# Check current ownership
+ls -la /path/to/your/projects
+
+# Fix permissions
+sudo chown -R 10001:10001 /path/to/your/projects
+# Or make world-writable
+chmod -R a+rw /path/to/your/projects
+```
+</Accordion>
+
+<Accordion title="ElectricSQL fails to connect">
+ElectricSQL requires the `electric_sync` database user, which the remote server creates on first startup. If ElectricSQL cannot connect:
+
+1. Check that the remote server started successfully
+2. Verify `ELECTRIC_ROLE_PASSWORD` matches in your `.env`
+3. Restart ElectricSQL:
+
+```bash
+docker compose -f docker-compose.full.yml restart electric
+```
+</Accordion>
+
+<Accordion title="Port conflicts">
+If default ports are already in use, change them in your `.env`:
+
+```env
+VK_LOCAL_PORT=3005                       # Local server (default: 3002)
+REMOTE_SERVER_PORTS=127.0.0.1:3001:8081  # Remote server (default: 3000)
+RELAY_SERVER_PORT=8083                   # Relay server (default: 8082)
+```
+</Accordion>
+
+<Accordion title="Local server can't connect to remote server">
+The local server connects to the remote server internally at `http://remote-server:8081`. Verify:
+
+```bash
+# Check remote server health from inside the local server container
+docker compose -f docker-compose.full.yml exec vibe-kanban \
+  wget --spider -q http://remote-server:8081/v1/health && echo "OK"
+```
+
+If this fails, check that both services are on the same Docker network and that the remote server is healthy.
+</Accordion>
+</AccordionGroup>

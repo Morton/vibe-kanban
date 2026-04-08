@@ -1,0 +1,19 @@
+# Caddyfile for the full Docker deployment (docker-compose.full.yml).
+#
+# Routes:
+#   {DOMAIN}        → remote-server (Cloud backend + UI)
+#   relay.{DOMAIN}  → relay-server  (tunnel endpoints)
+#
+# The local vibe-kanban server is exposed on its own port (VK_LOCAL_PORT)
+# and does not go through Caddy.
+#
+# For local development (HTTP only), override DOMAIN=localhost:8080 and
+# set CADDY_PORT=8080 in your .env file.
+
+{$DOMAIN} {
+	reverse_proxy remote-server:8081
+}
+
+relay.{$DOMAIN} {
+	reverse_proxy relay-server:8082
+}
